@@ -1,0 +1,91 @@
+name: Release bridge
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            artifact_name: bridge.exe
+            asset_name: bridge-windows.exe
+          - os: macos-latest
+            artifact_name: bridge
+            asset_name: bridge-macos
+          - os: ubuntu-latest
+            artifact_name: bridge
+            asset_name: bridge-linux
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install build deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install pyinstaller
+          pip install -r requirements.txt
+
+      - name: Build one-file binary
+        run: pyinstaller --onefile --name bridge --collect-all requests bridge.py
+
+      - name: Rename artifact
+        shell: bash
+        run: |
+          mv "dist/${{ matrix.artifact_name }}" "dist/${{ matrix.asset_name }}"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset_name }}
+          path: dist/${{ matrix.asset_name }}
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Stage Python fallback bundle
+        run: |
+          mkdir -p dist/python-source
+          cp bridge.py requirements.txt run_bridge.bat run_bridge.command dist/python-source/
+          (cd dist && zip -r bridge-python-source.zip python-source)
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/bridge-windows.exe
+            dist/bridge-macos
+            dist/bridge-linux
+            dist/bridge-python-source.zip
+          body: |
+            Companion bridge for the Boney World Bosses WoW addon.
+
+            **Download the binary for your OS:**
+            - Windows: `bridge-windows.exe`
+            - macOS: `bridge-macos` (right-click → Open on first launch; we don't notarize)
+            - Linux: `bridge-linux`
+            - Python users: `bridge-python-source.zip` (needs Python 3.11+ and `pip install -r requirements.txt`)
+
+            After downloading, run the binary anywhere on your computer **except inside your WoW `AddOns/` folder**. On first launch it asks you for your WoW install folder (the `_anniversary_` folder containing `Logs/` and `WTF/`); the path is cached for future runs. Config (guild id, Discord id, bot url) comes from the addon's SavedVariables — run `/bwb setup` in WoW then `/reload` if you haven't configured the addon yet.
