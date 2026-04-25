@@ -69,6 +69,7 @@ jobs:
         run: |
           mkdir -p dist/python-source
           cp bridge.py requirements.txt run_bridge.bat run_bridge.command dist/python-source/
+          cp -R bwb dist/python-source/bwb
           (cd dist && zip -r bridge-python-source.zip python-source)
 
       - name: Publish release
