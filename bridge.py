@@ -766,6 +766,7 @@ def post_kill_report(kill: dict) -> bool:
         "boss": boss_key,
         "time": kill.get("time", "?"),
         "date": kill.get("date", ""),
+        "timestamp": kill.get("timestamp", 0),
         "layer": kill.get("layer", "?"),
         "layerId": kill.get("layerId", "?"),
         "msg": f"{boss_name} was killed!",
@@ -1008,6 +1009,7 @@ def check_layer_snapshot(state: dict, verbose: bool = False) -> None:
             "characterName": snapshot.get("characterName", ""),
             "time": snap_time,
             "date": snap_date,
+            "timestamp": snapshot["timestamp"],
         }
 
         print(f"[LAYER] Sending payload: {json.dumps(alert, indent=2)}")
@@ -1141,6 +1143,7 @@ def check_scout_report(state: dict, verbose: bool = False) -> None:
             "characterName": character_name,
             "time": scout_time,
             "date": scout_date,
+            "timestamp": report["timestamp"],
         }
 
         if post_to_bot(alert):
@@ -1267,6 +1270,7 @@ def check_callout_report(state: dict, verbose: bool = False) -> None:
             "characterName": character_name,
             "time": callout_time,
             "date": callout_date,
+            "timestamp": report["timestamp"],
         }
 
         if post_to_bot(alert):
@@ -1461,7 +1465,8 @@ def process_line(line: str) -> None:
 
     print(f"[ALERT] COMBAT_DETECTED: {boss_name} (NPC {result['npc_id']}) - {result['event']} - Layer {layer} ({instance_id})")
 
-    now_time, now_date = format_timestamp(time.time())
+    now_epoch = int(time.time())
+    now_time, now_date = format_timestamp(now_epoch)
 
     alert = {
         "alertType": "COMBAT_DETECTED",
@@ -1475,6 +1480,7 @@ def process_line(line: str) -> None:
         "layerId": instance_id,
         "time": now_time,
         "date": now_date,
+        "timestamp": now_epoch,
     }
     post_to_bot(alert)
 
