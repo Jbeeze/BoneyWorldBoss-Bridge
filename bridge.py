@@ -47,6 +47,15 @@ CONFIG = {
 
     # How often to print the "waiting for in-game setup" message (seconds)
     "WAIT_MESSAGE_INTERVAL": 30,
+
+    # Seconds without combat-log mtime advance before bridge synthesizes a
+    # SCOUT_REPORT(off). The addon enables LoggingCombat(true) while scouting,
+    # so the file grows continuously while the player is in-world. Override
+    # via env var for testing (e.g. BWB_SCOUT_HEARTBEAT_TIMEOUT=30).
+    "SCOUT_HEARTBEAT_TIMEOUT": int(os.environ.get("BWB_SCOUT_HEARTBEAT_TIMEOUT", 300)),
+
+    # How often to evaluate scout heartbeat staleness (seconds)
+    "SCOUT_HEARTBEAT_CHECK_INTERVAL": 30,
 }
 
 # Script directory. When bundled via PyInstaller --onefile, __file__ points at
@@ -369,7 +378,17 @@ def load_state() -> dict:
                 return json.load(f)
         except (json.JSONDecodeError, IOError):
             pass
-    return {"last_inode": 0, "last_pos": 0, "reported_kills": [], "last_layer_timestamp": 0, "last_scout_timestamp": 0}
+    return {
+        "last_inode": 0,
+        "last_pos": 0,
+        "reported_kills": [],
+        "last_layer_timestamp": 0,
+        "last_scout_timestamp": 0,
+        # active_scout: dict while scouting, None otherwise. Shape:
+        # { characterName, boss, layer, layerId, started_at,
+        #   last_log_mtime (float), last_log_mtime_seen_at (float wall-clock) }
+        "active_scout": None,
+    }
 
 
 def save_state(state: dict) -> None:
@@ -1148,6 +1167,26 @@ def check_scout_report(state: dict, verbose: bool = False) -> None:
 
         if post_to_bot(alert):
             state["last_scout_timestamp"] = report["timestamp"]
+            if action == "on":
+                # Capture context now while the player is online, so a later
+                # synthetic scout-off (after combat log goes stale) has fresh
+                # character/boss/layer to report.
+                log_path = find_latest_combat_log()
+                try:
+                    log_mtime = os.path.getmtime(log_path) if log_path else 0.0
+                except OSError:
+                    log_mtime = 0.0
+                state["active_scout"] = {
+                    "characterName": character_name,
+                    "boss": boss,
+                    "layer": layer,
+                    "layerId": layer_id,
+                    "started_at": report["timestamp"],
+                    "last_log_mtime": log_mtime,
+                    "last_log_mtime_seen_at": time.time(),
+                }
+            else:
+                state["active_scout"] = None
             save_state(state)
             print(f"[SCOUT] Successfully reported scout {action}")
         else:
@@ -1155,6 +1194,74 @@ def check_scout_report(state: dict, verbose: bool = False) -> None:
 
     finally:
         _checking_scout = False
+
+
+def emit_synthetic_scout_off(state: dict, reason: str = "heartbeat_stale") -> bool:
+    """Send a synthetic SCOUT_REPORT(off) when the scouting player's combat
+    log has gone stale. Sources character/boss/layer from state['active_scout']
+    because the player is offline; SavedVariables won't reflect a fresh off."""
+    ctx = state.get("active_scout")
+    if not ctx:
+        return False
+
+    now_epoch = int(time.time())
+    scout_time, scout_date = format_timestamp(now_epoch)
+
+    boss = ctx.get("boss", "")
+    alert = {
+        "alertType": "SCOUT_REPORT",
+        "action": "off",
+        "boss": boss,
+        "layer": ctx.get("layer", "?"),
+        "layerId": ctx.get("layerId", "?"),
+        "characterName": ctx.get("characterName", ""),
+        "time": scout_time,
+        "date": scout_date,
+        "timestamp": now_epoch,
+        "synthetic": True,
+        "syntheticReason": reason,
+    }
+
+    boss_display = _boss_display_names.get(boss, boss)
+    print(f"[SCOUT] Synthetic scout-off ({reason}): {ctx.get('characterName', '?')} ({boss_display} L{ctx.get('layer', '?')})")
+
+    if post_to_bot(alert):
+        # Bump dedup baseline so a stale on-report still in SavedVariables
+        # (older than now_epoch) cannot re-trigger check_scout_report.
+        state["last_scout_timestamp"] = max(state.get("last_scout_timestamp", 0), now_epoch)
+        state["active_scout"] = None
+        save_state(state)
+        return True
+    print("[SCOUT] Failed to send synthetic scout-off, will retry next tick")
+    return False
+
+
+def check_scout_heartbeat(state: dict) -> None:
+    """If a scout is active, check whether the combat log has advanced.
+    Stale beyond SCOUT_HEARTBEAT_TIMEOUT -> synthetic scout-off."""
+    ctx = state.get("active_scout")
+    if not ctx:
+        return
+
+    log_path = find_latest_combat_log()
+    now = time.time()
+    mtime = None
+    if log_path:
+        try:
+            mtime = os.path.getmtime(log_path)
+        except OSError:
+            mtime = None
+
+    if mtime is not None and mtime > ctx.get("last_log_mtime", 0.0):
+        ctx["last_log_mtime"] = mtime
+        ctx["last_log_mtime_seen_at"] = now
+        state["active_scout"] = ctx
+        save_state(state)
+        return
+
+    last_seen = ctx.get("last_log_mtime_seen_at", now)
+    if now - last_seen >= CONFIG["SCOUT_HEARTBEAT_TIMEOUT"]:
+        emit_synthetic_scout_off(state, reason="heartbeat_stale")
 
 
 # =============================================================================
@@ -1332,6 +1439,7 @@ def tail_log_file(state: dict):
 
     file_handle = None
     last_kill_check = time.time()  # Don't check immediately, main_loop already did
+    last_heartbeat_check = time.time()
 
     while True:
         try:
@@ -1346,6 +1454,10 @@ def tail_log_file(state: dict):
                 check_scout_report(state, verbose=False)
                 check_callout_report(state, verbose=False)
                 last_kill_check = now
+
+            if now - last_heartbeat_check >= CONFIG["SCOUT_HEARTBEAT_CHECK_INTERVAL"]:
+                check_scout_heartbeat(state)
+                last_heartbeat_check = now
 
             # Find the latest combat log file
             latest_log = find_latest_combat_log()
@@ -1549,6 +1661,14 @@ def main_loop() -> None:
 
     # Load state
     state = load_state()
+
+    # Recover from a crash / restart with an active scout. If the combat log
+    # is stale, fire the synthetic off now so the channel doesn't keep
+    # showing a phantom scout. If the log is fresh, this just refreshes the
+    # heartbeat timestamps.
+    if state.get("active_scout"):
+        print("[SCOUT] Active scout found in persisted state; checking heartbeat...")
+        check_scout_heartbeat(state)
 
     # Do initial kill report check (verbose)
     print("[KILL] Checking for pending kill reports...")
