@@ -138,10 +138,11 @@ def check_layer_snapshot(state: dict, verbose: bool = False) -> None:
 
         age = time.time() - snapshot["timestamp"]
         if age > shared.LAYER_STALENESS_WINDOW:
-            print(
-                f"[LAYER] Skipping stale snapshot ({int(age)}s old, "
-                f"threshold {shared.LAYER_STALENESS_WINDOW}s)"
-            )
+            if verbose:
+                print(
+                    f"[LAYER] Skipping stale snapshot ({int(age)}s old, "
+                    f"threshold {shared.LAYER_STALENESS_WINDOW}s)"
+                )
             return
 
         trigger = snapshot["trigger"]
